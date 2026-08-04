@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
     from mtg_mcp_server.services.edhrec import EDHRECClient
     from mtg_mcp_server.services.scryfall import ScryfallClient
+    from mtg_mcp_server.services.scryfall_bulk import ScryfallBulkClient
     from mtg_mcp_server.services.spellbook import SpellbookClient
     from mtg_mcp_server.types import Card, Combo, EDHRECCard, EDHRECCommanderData
 
@@ -685,13 +686,16 @@ async def budget_upgrade(
     num_suggestions: int = 10,
     scryfall: ScryfallClient,
     edhrec: EDHRECClient | None,
+    bulk: ScryfallBulkClient | None = None,
     on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     response_format: Literal["detailed", "concise"] = "detailed",
 ) -> WorkflowResult:
     """Suggest budget-friendly upgrades ranked by synergy-per-dollar.
 
-    Fetches EDHREC staples for the commander, looks up Scryfall prices,
-    then ranks affordable cards by synergy/$.
+    Fetches EDHREC staples for the commander, then prices them — bulk data
+    first (rate-limit-free, batched), falling back to live Scryfall lookups
+    only for cards bulk data doesn't have — then ranks affordable cards by
+    synergy/$.
 
     Args:
         commander_name: The commander to find upgrades for.
@@ -699,6 +703,10 @@ async def budget_upgrade(
         num_suggestions: Number of top suggestions to return.
         scryfall: Initialized ScryfallClient.
         edhrec: Initialized EDHRECClient, or None if disabled.
+        bulk: Initialized ScryfallBulkClient, or None if disabled. EDHREC
+            staples for popular commanders can number in the hundreds —
+            pricing them all via live Scryfall calls reliably trips
+            Scryfall's rate limit. Bulk data avoids that entirely.
         on_progress: Optional callback for progress reporting.
 
     Returns:
@@ -736,30 +744,60 @@ async def budget_upgrade(
             data={"commander_name": commander_name, "budget": budget, "suggestions": []},
         )
 
-    # Step 2/2: Fetch Scryfall prices in parallel
+    # Step 2/2: Resolve prices — bulk data first (batched, rate-limit-free),
+    # falling back to live Scryfall only for cards bulk data doesn't have.
     if on_progress is not None:
         await on_progress(2, 2)
 
-    # Limit concurrent Scryfall requests to avoid overwhelming the connection pool.
-    sem = asyncio.Semaphore(10)
+    all_names = [ecard.name for ecard in all_edhrec_cards]
 
-    async def _fetch_price(name: str) -> Card:
-        """Fetch a single card's price with concurrency limiting."""
-        async with sem:
-            return await scryfall.get_card_by_name(name)
+    bulk_results: dict[str, Card | None] = {}
+    if bulk is not None:
+        try:
+            bulk_results = await bulk.get_cards(all_names)
+        except Exception:
+            # Bulk data unavailable (download failure, stale/corrupt state, etc.) —
+            # degrade to the live Scryfall fallback for every candidate rather than
+            # letting the whole tool call fail. Mirrors card_resolver.resolve_card().
+            log.warning("budget_upgrade.bulk_error", commander=commander_name, exc_info=True)
 
-    price_tasks = [_fetch_price(ecard.name) for ecard in all_edhrec_cards]
-    price_results = await asyncio.gather(*price_tasks, return_exceptions=True)
+    # Dedupe misses — the same card can appear in multiple EDHREC categories,
+    # and there's no reason to fetch it from Scryfall more than once.
+    missing_names = list(
+        dict.fromkeys(name for name in all_names if bulk_results.get(name) is None)
+    )
 
-    # Build candidates: pair EDHREC data with Scryfall prices
+    # No outer semaphore here: BaseClient._request() already serializes every
+    # Scryfall request through its own internal semaphore + rate-limit delay,
+    # so a client-side concurrency cap on top of that is purely cosmetic.
+    fallback_tasks = [scryfall.get_card_by_name(name) for name in missing_names]
+    fallback_results = await asyncio.gather(*fallback_tasks, return_exceptions=True)
+    fallback_by_name: dict[str, Card | BaseException] = dict(
+        zip(missing_names, fallback_results, strict=True)
+    )
+
+    log.debug(
+        "budget_upgrade.price_resolution",
+        commander=commander_name,
+        candidates=len(all_names),
+        bulk_hits=len(all_names) - len(missing_names),
+        fallback_lookups=len(missing_names),
+    )
+
+    # Build candidates: pair EDHREC data with resolved prices
     candidates: list[tuple[EDHRECCard, float, float]] = []  # (edhrec, price, synergy_per_dollar)
     price_failures = 0
-    for ecard, price_result in zip(all_edhrec_cards, price_results, strict=True):
-        if isinstance(price_result, BaseException):
-            log.debug("budget_upgrade.price_failed", card=ecard.name, error=str(price_result))
-            price_failures += 1
-            continue
-        scryfall_card: Card = price_result
+    for ecard in all_edhrec_cards:
+        scryfall_card = bulk_results.get(ecard.name)
+        if scryfall_card is None:
+            fallback_result = fallback_by_name.get(ecard.name)
+            if fallback_result is None or isinstance(fallback_result, BaseException):
+                log.debug(
+                    "budget_upgrade.price_failed", card=ecard.name, error=str(fallback_result)
+                )
+                price_failures += 1
+                continue
+            scryfall_card = fallback_result
         if scryfall_card.prices.usd is None:
             continue
         price = float(scryfall_card.prices.usd)
@@ -805,6 +843,10 @@ async def budget_upgrade(
         lines.append("**Data Sources:**")
         lines.append("- [Scryfall](https://scryfall.com): OK")
         lines.append("- [EDHREC](https://edhrec.com): OK")
+        bulk_status = "OK" if bulk is not None else "Disabled"
+        lines.append(
+            f"- [Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): {bulk_status}"
+        )
 
     log.info("budget_upgrade.complete", commander=commander_name, suggestions=len(top))
     data = {

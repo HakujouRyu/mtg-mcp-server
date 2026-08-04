@@ -424,7 +424,9 @@ async def budget_upgrade(
     """Suggest budget-friendly upgrades for a commander deck.
 
     Ranks EDHREC staples by synergy-per-dollar within the given budget ceiling.
-    Requires EDHREC (for staples) and Scryfall (for prices).
+    Requires EDHREC (for staples) and Scryfall (for prices). Uses Scryfall bulk
+    data for rate-limit-free pricing when available, falling back to the live
+    API only for cards bulk data doesn't have.
     """
     from mtg_mcp_server.workflows.commander import budget_upgrade as impl
 
@@ -440,6 +442,7 @@ async def budget_upgrade(
             num_suggestions=num_suggestions,
             scryfall=_require_scryfall(),
             edhrec=_require_edhrec(),
+            bulk=_bulk,
             on_progress=lambda step, total: _progress(ctx, step, total),
             response_format=response_format,
         )

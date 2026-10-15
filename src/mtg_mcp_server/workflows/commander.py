@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 
 import structlog
 
+from mtg_mcp_server.services.scryfall_bulk import ScryfallBulkError
 from mtg_mcp_server.utils.slim import slim_card, slim_combo, slim_edhrec_card
 from mtg_mcp_server.workflows import WorkflowResult
 

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Scryfall bulk data failed to load after Scryfall retired the `download_uri` field (2026-07-20). The bulk client now falls back to `jsonl_download_uri` and parses gzip-compressed JSONL as well as the legacy JSON array format.
+- `budget_upgrade` no longer times out on popular commanders. Staple prices are now resolved from Scryfall bulk data in a single batch, with live Scryfall lookups only for cards bulk data doesn't have. The Data Sources footer now reports bulk data status (OK / Unavailable / Disabled).
+
 ## [3.0.0] - 2026-04-03
 
 v3.0.0 marks the constructed metagame milestone. The server now covers all major

@@ -572,7 +572,7 @@ async def card_comparison(
         await on_progress(2, 3)
 
     # EDHREC synergy lookups (parallel)
-    synergy_results: list[EDHRECCard | None | BaseException] = []
+    synergy_results: list[EDHRECCard | BaseException | None] = []
     if edhrec is not None:
         synergy_tasks = [edhrec.card_synergy(card.name, commander_name) for card in card_data]
         synergy_results = await asyncio.gather(*synergy_tasks, return_exceptions=True)
@@ -752,13 +752,15 @@ async def budget_upgrade(
     all_names = [ecard.name for ecard in all_edhrec_cards]
 
     bulk_results: dict[str, Card | None] = {}
+    bulk_failed = False
     if bulk is not None:
         try:
             bulk_results = await bulk.get_cards(all_names)
-        except Exception:
-            # Bulk data unavailable (download failure, stale/corrupt state, etc.) —
-            # degrade to the live Scryfall fallback for every candidate rather than
-            # letting the whole tool call fail. Mirrors card_resolver.resolve_card().
+        except ScryfallBulkError:
+            # Bulk data unavailable (download or parse failure) — degrade to the
+            # live Scryfall fallback for every candidate rather than letting the
+            # whole tool call fail.
+            bulk_failed = True
             log.warning("budget_upgrade.bulk_error", commander=commander_name, exc_info=True)
 
     # Dedupe misses — the same card can appear in multiple EDHREC categories,
@@ -843,7 +845,12 @@ async def budget_upgrade(
         lines.append("**Data Sources:**")
         lines.append("- [Scryfall](https://scryfall.com): OK")
         lines.append("- [EDHREC](https://edhrec.com): OK")
-        bulk_status = "OK" if bulk is not None else "Disabled"
+        if bulk is None:
+            bulk_status = "Disabled"
+        elif bulk_failed:
+            bulk_status = "Unavailable (fell back to Scryfall API)"
+        else:
+            bulk_status = "OK"
         lines.append(
             f"- [Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): {bulk_status}"
         )

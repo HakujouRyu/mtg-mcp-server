@@ -12,6 +12,7 @@ import pytest
 
 from mtg_mcp_server.services.edhrec import EDHRECError
 from mtg_mcp_server.services.scryfall import CardNotFoundError
+from mtg_mcp_server.services.scryfall_bulk import ScryfallBulkDownloadError
 from mtg_mcp_server.services.spellbook import SpellbookError
 from mtg_mcp_server.types import (
     Card,
@@ -747,7 +748,7 @@ class TestBudgetUpgrade:
         )
 
         bulk = AsyncMock()
-        bulk.get_cards = AsyncMock(side_effect=RuntimeError("bulk data unavailable"))
+        bulk.get_cards = AsyncMock(side_effect=ScryfallBulkDownloadError("bulk data unavailable"))
 
         result = await budget_upgrade(
             COMMANDER_NAME,
@@ -763,9 +764,10 @@ class TestBudgetUpgrade:
         assert "Spore Frog" in result.markdown
         assert "Sakura-Tribe Elder" in result.markdown
         assert "Sol Ring" in result.markdown
-        assert "Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): OK" in (
-            result.markdown
-        )
+        assert (
+            "Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): "
+            "Unavailable (fell back to Scryfall API)"
+        ) in result.markdown
 
     async def test_edhrec_disabled(
         self,

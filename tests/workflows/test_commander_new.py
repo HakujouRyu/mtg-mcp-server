@@ -12,6 +12,7 @@ import pytest
 
 from mtg_mcp_server.services.edhrec import EDHRECError
 from mtg_mcp_server.services.scryfall import CardNotFoundError
+from mtg_mcp_server.services.scryfall_bulk import ScryfallBulkDownloadError
 from mtg_mcp_server.services.spellbook import SpellbookError
 from mtg_mcp_server.types import (
     Card,
@@ -214,6 +215,13 @@ def spellbook() -> AsyncMock:
 def edhrec() -> AsyncMock:
     """Provide a mock EDHRECClient."""
     return AsyncMock()
+
+
+def _make_bulk(cards: dict[str, Card | None]) -> AsyncMock:
+    """Mock ScryfallBulkClient whose get_cards() returns the given lookup dict."""
+    mock = AsyncMock()
+    mock.get_cards.return_value = cards
+    return mock
 
 
 # ===========================================================================
@@ -574,6 +582,192 @@ class TestBudgetUpgrade:
         assert "**Data Sources:**" in result.markdown
         assert "Scryfall](https://scryfall.com)" in result.markdown
         assert "EDHREC](https://edhrec.com)" in result.markdown
+        # No bulk client passed — footer should reflect that
+        assert "Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): Disabled" in (
+            result.markdown
+        )
+
+    async def test_bulk_data_used_when_available(
+        self,
+        scryfall: AsyncMock,
+        edhrec: AsyncMock,
+        mock_edhrec_data: EDHRECCommanderData,
+        sol_ring: Card,
+        spore_frog: Card,
+    ) -> None:
+        """Bulk data covers every candidate — Scryfall is never called."""
+        edhrec.commander_top_cards = AsyncMock(return_value=mock_edhrec_data)
+        ste_card = Card(
+            id="test-ste",
+            name="Sakura-Tribe Elder",
+            mana_cost="{1}{G}",
+            type_line="Creature — Snake Shaman",
+            colors=["G"],
+            color_identity=["G"],
+            set="uma",
+            rarity="common",
+            prices=CardPrices(usd="0.50"),
+            edhrec_rank=100,
+        )
+        bauble_card = Card(
+            id="test-bauble",
+            name="Wayfarer's Bauble",
+            mana_cost="{1}",
+            type_line="Artifact",
+            colors=[],
+            color_identity=[],
+            set="cm2",
+            rarity="common",
+            prices=CardPrices(usd="0.35"),
+            edhrec_rank=200,
+        )
+        bulk = _make_bulk(
+            {
+                "Spore Frog": spore_frog,
+                "Sakura-Tribe Elder": ste_card,
+                "Sol Ring": sol_ring,
+                "Wayfarer's Bauble": bauble_card,
+            }
+        )
+        scryfall.get_card_by_name = AsyncMock(side_effect=AssertionError("should not be called"))
+
+        result = await budget_upgrade(
+            COMMANDER_NAME,
+            budget=5.00,
+            num_suggestions=10,
+            scryfall=scryfall,
+            edhrec=edhrec,
+            bulk=bulk,
+        )
+
+        scryfall.get_card_by_name.assert_not_called()
+        assert "Spore Frog" in result.markdown
+        assert "Sakura-Tribe Elder" in result.markdown
+        assert "Sol Ring" in result.markdown
+        assert "Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): OK" in (
+            result.markdown
+        )
+
+    async def test_bulk_data_partial_fallback(
+        self,
+        scryfall: AsyncMock,
+        edhrec: AsyncMock,
+    ) -> None:
+        """Bulk data misses one candidate — Scryfall is called only for that one."""
+        data = EDHRECCommanderData(
+            commander_name=COMMANDER_NAME,
+            total_decks=19741,
+            cardlists=[
+                EDHRECCardList(
+                    header="Creatures",
+                    tag="creatures",
+                    cardviews=[
+                        EDHRECCard(name="In Bulk", synergy=0.5, inclusion=50, num_decks=9000),
+                        EDHRECCard(name="Not In Bulk", synergy=0.3, inclusion=40, num_decks=7000),
+                    ],
+                ),
+            ],
+        )
+        edhrec.commander_top_cards = AsyncMock(return_value=data)
+
+        in_bulk_card = Card(
+            id="test-in-bulk",
+            name="In Bulk",
+            mana_cost="{G}",
+            type_line="Creature",
+            colors=["G"],
+            color_identity=["G"],
+            set="cmd",
+            rarity="common",
+            prices=CardPrices(usd="1.00"),
+            edhrec_rank=100,
+        )
+        not_in_bulk_card = Card(
+            id="test-not-in-bulk",
+            name="Not In Bulk",
+            mana_cost="{1}",
+            type_line="Artifact",
+            colors=[],
+            color_identity=[],
+            set="cmd",
+            rarity="common",
+            prices=CardPrices(usd="2.00"),
+            edhrec_rank=200,
+        )
+        bulk = _make_bulk({"In Bulk": in_bulk_card, "Not In Bulk": None})
+        scryfall.get_card_by_name = AsyncMock(return_value=not_in_bulk_card)
+
+        result = await budget_upgrade(
+            COMMANDER_NAME,
+            budget=5.00,
+            scryfall=scryfall,
+            edhrec=edhrec,
+            bulk=bulk,
+        )
+
+        scryfall.get_card_by_name.assert_called_once_with("Not In Bulk")
+        assert "In Bulk" in result.markdown
+        assert "Not In Bulk" in result.markdown
+
+    async def test_bulk_data_error_falls_back_to_scryfall(
+        self,
+        scryfall: AsyncMock,
+        edhrec: AsyncMock,
+        mock_edhrec_data: EDHRECCommanderData,
+        sol_ring: Card,
+        spore_frog: Card,
+    ) -> None:
+        """Bulk data raises (e.g. download failure) — degrades to all-Scryfall lookups."""
+        edhrec.commander_top_cards = AsyncMock(return_value=mock_edhrec_data)
+        ste_card = Card(
+            id="test-ste",
+            name="Sakura-Tribe Elder",
+            mana_cost="{1}{G}",
+            type_line="Creature — Snake Shaman",
+            colors=["G"],
+            color_identity=["G"],
+            set="uma",
+            rarity="common",
+            prices=CardPrices(usd="0.50"),
+            edhrec_rank=100,
+        )
+        bauble_card = Card(
+            id="test-bauble",
+            name="Wayfarer's Bauble",
+            mana_cost="{1}",
+            type_line="Artifact",
+            colors=[],
+            color_identity=[],
+            set="cm2",
+            rarity="common",
+            prices=CardPrices(usd="0.35"),
+            edhrec_rank=200,
+        )
+        scryfall.get_card_by_name = AsyncMock(
+            side_effect=[spore_frog, ste_card, sol_ring, bauble_card]
+        )
+
+        bulk = AsyncMock()
+        bulk.get_cards = AsyncMock(side_effect=ScryfallBulkDownloadError("bulk data unavailable"))
+
+        result = await budget_upgrade(
+            COMMANDER_NAME,
+            budget=5.00,
+            num_suggestions=10,
+            scryfall=scryfall,
+            edhrec=edhrec,
+            bulk=bulk,
+        )
+
+        # Every candidate fell back to Scryfall — no crash, no data loss.
+        assert scryfall.get_card_by_name.call_count == 4
+        assert "Spore Frog" in result.markdown
+        assert "Sakura-Tribe Elder" in result.markdown
+        assert "Sol Ring" in result.markdown
+        assert (
+            "Scryfall Bulk Data](https://scryfall.com/docs/api/bulk-data): "
+            "Unavailable (fell back to Scryfall API)"
+        ) in result.markdown
 
     async def test_edhrec_disabled(
         self,

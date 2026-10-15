@@ -460,7 +460,7 @@ Suggest budget-friendly upgrades for a commander deck.
 |-------|--------|
 | Input | `commander_name: str`, `budget: float` (max price per card in USD), `num_suggestions: int = 10` |
 | Output | Markdown table ranked by synergy-per-dollar: name, synergy, inclusion %, price, synergy/$ |
-| Backends | Scryfall (required, for prices) + EDHREC (required, for staples) |
+| Backends | Scryfall bulk data (optional, rate-limit-free price lookup) + Scryfall API (required, fallback for bulk misses) + EDHREC (required, for staples) |
 | Error | Returns message if EDHREC disabled, no staples found, or no cards under budget |
 | Progress | Reports progress (1/2 fetching staples, 2/2 fetching prices) |
 | Annotations | readOnly=true, idempotent=true, openWorld=true |

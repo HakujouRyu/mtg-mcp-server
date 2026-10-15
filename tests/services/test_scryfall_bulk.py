@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
 import json
 import time
 from pathlib import Path
@@ -38,6 +39,23 @@ def _load_oracle_cards() -> str:
 def _load_oracle_cards_bytes() -> bytes:
     """Load the oracle cards sample fixture as bytes (for HTTP response body)."""
     return (FIXTURES / "oracle_cards_sample.json").read_bytes()
+
+
+def _load_oracle_cards_jsonl_gz() -> bytes:
+    """Build gzip-compressed JSONL bytes equivalent to the JSON-array fixture.
+
+    Scryfall's ``jsonl_download_uri`` format serves one JSON card object per
+    line, gzip-compressed. Constructed from the existing plain-array fixture
+    so both formats are asserted to parse to the same card set.
+    """
+    cards = json.loads(_load_oracle_cards())
+    jsonl = "\n".join(json.dumps(card) for card in cards)
+    return gzip.compress(jsonl.encode("utf-8"))
+
+
+def _load_jsonl_metadata() -> dict:
+    """Load the jsonl-only bulk-data metadata fixture (no ``download_uri``)."""
+    return json.loads((FIXTURES / "bulk_metadata_jsonl.json").read_text())
 
 
 # ---------------------------------------------------------------------------
@@ -679,14 +697,17 @@ class TestExceptionTypes:
 class TestMetadataValidation:
     """Test metadata response validation and edge cases."""
 
-    async def test_missing_download_uri_raises(self):
-        """Missing download_uri key in metadata raises ScryfallBulkError."""
+    async def test_missing_both_download_uri_fields_raises(self):
+        """Missing both download_uri and jsonl_download_uri raises ScryfallBulkError."""
         with respx.mock:
             _mock_metadata_route(respx, metadata={"object": "bulk_data", "type": "oracle_cards"})
 
             client = ScryfallBulkClient(base_url=_BASE_URL, refresh_hours=24)
             async with client:
-                with pytest.raises(ScryfallBulkError, match="missing 'download_uri'"):
+                with pytest.raises(
+                    ScryfallBulkError,
+                    match="missing both 'download_uri' and 'jsonl_download_uri'",
+                ):
                     await client.ensure_loaded()
 
     async def test_non_json_metadata_raises(self):
@@ -702,6 +723,38 @@ class TestMetadataValidation:
             async with client:
                 with pytest.raises(ScryfallBulkDownloadError, match="not valid JSON"):
                     await client.ensure_loaded()
+
+
+class TestJSONLFormat:
+    """Test the gzip-compressed JSONL bulk data format (``jsonl_download_uri``)."""
+
+    async def test_jsonl_download_uri_parses_same_cards(self):
+        """jsonl_download_uri-only metadata parses to the same card set as the JSON-array fixture."""
+        metadata = _load_jsonl_metadata()
+        assert "download_uri" not in metadata
+
+        with respx.mock:
+            _mock_metadata_route(respx, metadata=metadata)
+            respx.get(metadata["jsonl_download_uri"]).mock(
+                return_value=httpx.Response(200, content=_load_oracle_cards_jsonl_gz())
+            )
+
+            client = ScryfallBulkClient(base_url=_BASE_URL, refresh_hours=24)
+            async with client:
+                await client.ensure_loaded()
+                # Same 27 playable cards as the JSON-array fixture (non-playable
+                # layouts filtered identically regardless of source format).
+                assert len(client._unique_cards) == 27
+                assert len(client._cards) == 28  # + 1 DFC front-face key
+
+                card = await client.get_card("Sol Ring")
+                assert card is not None
+                assert card.prices.usd == "1.50"
+                assert card.legalities["commander"] == "legal"
+
+                dfc = await client.get_card("Delver of Secrets")
+                assert dfc is not None
+                assert dfc.name == "Delver of Secrets // Insectile Aberration"
 
 
 class TestParseFailures:
